@@ -1,0 +1,109 @@
+name: Build YTSage True Portable (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Official upstream stable tag (e.g. v5.6.0). Do not use main for releases.'
+        required: true
+        default: 'v5.6.0'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ytsage-portable-manual-build
+  cancel-in-progress: false
+
+jobs:
+  build-portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout portable kit (your fork)
+        uses: actions/checkout@v4
+
+      - name: Checkout official YTSage source
+        uses: actions/checkout@v4
+        with:
+          repository: oop7/YTSage
+          ref: ${{ inputs.upstream_ref }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate selected version
+        shell: pwsh
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          $ref = $env:UPSTREAM_REF
+          if ($ref -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9.\-]*$') {
+            throw 'Choose an explicit version tag (v5.6.0 etc.). This prevents accidentally building an unreviewed commit.'
+          }
+          $pyproject = Get-Content upstream/pyproject.toml -Raw
+          $match = [regex]::Match($pyproject, '(?m)^version\s*=\s*"([0-9][^"\r\n]*)"')
+          if (-not $match.Success) { throw 'Could not determine YTSage version' }
+          $version = $match.Groups[1].Value
+          if ($ref -ne "v$version") { throw "Source version $version does not match selected tag $ref" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          Write-Host "Building official YTSage $version with portable source patch"
+
+      - name: Apply fail-closed portability patch
+        shell: pwsh
+        run: python portable-kit/patch_upstream.py upstream
+
+      - name: Install Windows build dependencies
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . cx_Freeze
+
+      - name: Freeze patched YTSage
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          python setup-scripts/setup_cxfreeze.py build_exe --build-exe dist/YTSage
+          if ($LASTEXITCODE -ne 0) { throw 'cx_Freeze failed' }
+          & ./setup-scripts/trim-build.ps1 -DistDir 'dist/YTSage'
+          if ($LASTEXITCODE -ne 0) { throw 'Build trimming failed' }
+
+      - name: Download verified bundled FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip'
+          $expectedSha256 = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
+          New-Item -ItemType Directory -Path ffmpeg-temp -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile 'ffmpeg-temp/ffmpeg.zip' -ErrorAction Stop
+          $actual = (Get-FileHash 'ffmpeg-temp/ffmpeg.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expectedSha256) { throw 'FFmpeg archive integrity verification failed' }
+          Expand-Archive 'ffmpeg-temp/ffmpeg.zip' -DestinationPath 'ffmpeg-temp' -Force
+          $ffmpeg = Get-ChildItem 'ffmpeg-temp' -Recurse -Filter 'ffmpeg.exe' -File | Select-Object -First 1
+          $ffprobe = Get-ChildItem 'ffmpeg-temp' -Recurse -Filter 'ffprobe.exe' -File | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) { throw 'Expected FFmpeg files missing after extraction' }
+          Copy-Item $ffmpeg.FullName 'upstream/dist/YTSage/ffmpeg.exe' -Force
+          Copy-Item $ffprobe.FullName 'upstream/dist/YTSage/ffprobe.exe' -Force
+
+      - name: Build community portable launcher and ZIP
+        shell: pwsh
+        env:
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          & ./portable-kit/package.ps1 -Version $env:VERSION -Repository $env:REPO_NAME
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+          python portable-kit/verify_package.py "artifacts/YTSage-v$env:VERSION-TRUE-Portable.zip"
+
+      - name: Upload downloadable portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTSage-TruePortable-${{ env.VERSION }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 7
